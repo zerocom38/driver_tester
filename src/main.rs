@@ -1,8 +1,6 @@
-use std::path::PathBuf;
-
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use rustyline::error::ReadlineError;
-use rustyline::{DefaultEditor, Result};
+use rustyline::DefaultEditor;
 
 #[derive(Parser)]
 #[command(name = "", no_binary_name = true)] // This name will show up in clap's error messages, so it is important to set it to "".
