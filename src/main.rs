@@ -3,20 +3,20 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 #[derive(Parser)]
-#[command(name = "", no_binary_name = true)] // This name will show up in clap's error messages, so it is important to set it to "".
+#[clap(name = "", no_binary_name = true)] // This name will show up in clap's error messages, so it is important to set it to "".
 enum Command {
     Test {
         arg: Option<String>,
     },
     List(ListCommand),
-    #[command(name = "pwm_set")]
+    #[clap(name = "pwm_set")]
     PwmSet,
 }
 
 #[derive(Parser)]
 struct ListCommand {
     /// An argument for the list command
-    #[arg(long)]
+    #[clap(long)]
     arg: Option<String>,
 }
 
