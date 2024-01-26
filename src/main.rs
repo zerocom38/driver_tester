@@ -3,7 +3,7 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 #[derive(Parser)]
-#[clap(name = "", no_binary_name = true)] // This name will show up in clap's error messages, so it is important to set it to "".
+#[command(name = "", no_binary_name = true)] // This name will show up in clap's error messages, so it is important to set it to "".
 enum Command {
     Test {
         arg: Option<String>,
