@@ -13,7 +13,9 @@ clap = { version = "4.4", features = ["derive", "color"] }
 clap-num = "1.1"
 rustyline = "13.0"
 shlex = "1.3"
-nix = { version = "0.27", features = ["ioctl"] }
-libc = "*"
+nix = { version = "0.27", features = ["ioctl", "inotify"] }
+libc = "0.2"
+drm = "0.11"
+sysfs_gpio = "0.6"
 
 [target.'cfg(unix)'.build-dependencies]
