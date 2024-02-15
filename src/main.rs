@@ -3,8 +3,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use clap::Parser;
-use drm::buffer::DrmFourcc;
-use drm::control::{connector, crtc};
+use drm::control::dumbbuffer::{DumbBuffer, DumbMapping};
 use nix::fcntl::OFlag;
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 use nix::sys::stat::Mode;
@@ -12,10 +11,13 @@ use nix::{ioctl_read, ioctl_write_ptr};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
+use drm::control::{Device as ControlDevice, FbCmd2Flags};
+use drm::Device as BasicDevice;
 use nix::fcntl::open;
 
-pub use drm::control::Device as ControlDevice;
-pub use drm::Device;
+use drm::buffer::{Buffer, DrmFourcc, DrmModifier, PlanarBuffer};
+
+use drm::control::{self, atomic, connector, crtc, property, AtomicCommitFlags};
 
 use sysfs_gpio::{Direction, Pin};
 
@@ -186,6 +188,11 @@ fn drm_test(gpio: &Pin) {
     println!("DRM test...");
     let card = Card::open_global();
 
+    card.set_client_capability(drm::ClientCapability::UniversalPlanes, true)
+        .expect("Unable to request UniversalPlanes capability");
+    card.set_client_capability(drm::ClientCapability::Atomic, true)
+        .expect("Unable to request Atomic capability");
+
     // Load the information.
     let res = card
         .resource_handles()
@@ -223,7 +230,7 @@ fn drm_test(gpio: &Pin) {
     let crtc = crtcinfo.first().expect("No crtcs found");
 
     // Select the pixel format
-    let fmt = DrmFourcc::Rgb888;
+    let fmt = DrmFourcc::Bgr888;
 
     // Create a DB
     // If buffer resolution is larger than display resolution, an ENOSPC (not enough video memory)
@@ -234,28 +241,165 @@ fn drm_test(gpio: &Pin) {
 
     // Map it and grey it out.
     {
+        let pitch = db.pitch() as usize;
         let mut map = card
             .map_dumb_buffer(&mut db)
             .expect("Could not map dumbbuffer");
-        for b in map.as_mut() {
-            *b = 128;
+        for (y, line) in map.as_mut().chunks_mut(pitch).enumerate() {
+            for (x, pixel) in line.chunks_mut(3).enumerate() {
+                // if (x & 0x1f) == 0
+                //     || (x == (1920 - 1))
+                //     || (x == (2048 - 1))
+                //     || (x == (3840 - 1))
+                //     || (x == (4096 - 1))
+                //     || (y & 0x1f) == 0
+                //     || (y == (1080 - 1))
+                //     || (y == (2160 - 1))
+                // {
+                //     pixel[0] = 255;
+                //     pixel[1] = 255;
+                //     pixel[2] = 255;
+                // } else {
+                //     pixel[0] = 0;
+                //     pixel[1] = 0;
+                //     pixel[2] = 0;
+                // }
+                let b = y as u8;
+                let g = x as u8;
+                let r = b ^ 0xff;
+                pixel[0] = r;
+                pixel[1] = g;
+                pixel[2] = b;
+            }
         }
     }
+
+    let pdb: XilinxDumbBuffer = db.into();
+
     // Create an FB:
     let fb = card
-        .add_framebuffer(&db, 24, 24)
+        .add_planar_framebuffer(&pdb, FbCmd2Flags::empty())
         .expect("Could not create FB");
 
-    // println!("{:#?}", mode);
-    // println!("{:#?}", fb);
-    // println!("{:#?}", db);
+    let planes = card.plane_handles().expect("Could not list planes");
+    let (better_planes, compatible_planes): (
+        Vec<control::plane::Handle>,
+        Vec<control::plane::Handle>,
+    ) = planes
+        .iter()
+        .filter(|&&plane| {
+            card.get_plane(plane)
+                .map(|plane_info| {
+                    let compatible_crtcs = res.filter_crtcs(plane_info.possible_crtcs());
+                    compatible_crtcs.contains(&crtc.handle())
+                })
+                .unwrap_or(false)
+        })
+        .partition(|&&plane| {
+            if let Ok(props) = card.get_properties(plane) {
+                for (&id, &val) in props.iter() {
+                    if let Ok(info) = card.get_property(id) {
+                        if info.name().to_str().map(|x| x == "type").unwrap_or(false) {
+                            return val == (drm::control::PlaneType::Primary as u32).into();
+                        }
+                    }
+                }
+            }
+            false
+        });
+    let plane = *better_planes.first().unwrap_or(&compatible_planes[0]);
+
+    println!("{:#?}", mode);
+    println!("{:#?}", fb);
+    println!("{:#?}", db);
+    println!("{:#?}", plane);
+
+    let con_props = card
+        .get_properties(con.handle())
+        .expect("Could not get props of connector")
+        .as_hashmap(&card)
+        .expect("Could not get a prop from connector");
+    let crtc_props = card
+        .get_properties(crtc.handle())
+        .expect("Could not get props of crtc")
+        .as_hashmap(&card)
+        .expect("Could not get a prop from crtc");
+    let plane_props = card
+        .get_properties(plane)
+        .expect("Could not get props of plane")
+        .as_hashmap(&card)
+        .expect("Could not get a prop from plane");
+
+    let mut atomic_req = atomic::AtomicModeReq::new();
+    atomic_req.add_property(
+        con.handle(),
+        con_props["CRTC_ID"].handle(),
+        property::Value::CRTC(Some(crtc.handle())),
+    );
+    let blob = card
+        .create_property_blob(&mode)
+        .expect("Failed to create blob");
+    atomic_req.add_property(crtc.handle(), crtc_props["MODE_ID"].handle(), blob);
+    atomic_req.add_property(
+        crtc.handle(),
+        crtc_props["ACTIVE"].handle(),
+        property::Value::Boolean(true),
+    );
+    atomic_req.add_property(
+        plane,
+        plane_props["FB_ID"].handle(),
+        property::Value::Framebuffer(Some(fb)),
+    );
+    atomic_req.add_property(
+        plane,
+        plane_props["CRTC_ID"].handle(),
+        property::Value::CRTC(Some(crtc.handle())),
+    );
+    atomic_req.add_property(
+        plane,
+        plane_props["SRC_X"].handle(),
+        property::Value::UnsignedRange(0),
+    );
+    atomic_req.add_property(
+        plane,
+        plane_props["SRC_Y"].handle(),
+        property::Value::UnsignedRange(0),
+    );
+    atomic_req.add_property(
+        plane,
+        plane_props["SRC_W"].handle(),
+        property::Value::UnsignedRange((mode.size().0 as u64) << 16),
+    );
+    atomic_req.add_property(
+        plane,
+        plane_props["SRC_H"].handle(),
+        property::Value::UnsignedRange((mode.size().1 as u64) << 16),
+    );
+    atomic_req.add_property(
+        plane,
+        plane_props["CRTC_X"].handle(),
+        property::Value::SignedRange(0),
+    );
+    atomic_req.add_property(
+        plane,
+        plane_props["CRTC_Y"].handle(),
+        property::Value::SignedRange(0),
+    );
+    atomic_req.add_property(
+        plane,
+        plane_props["CRTC_W"].handle(),
+        property::Value::UnsignedRange(mode.size().0 as u64),
+    );
+    atomic_req.add_property(
+        plane,
+        plane_props["CRTC_H"].handle(),
+        property::Value::UnsignedRange(mode.size().1 as u64),
+    );
 
     // Set the crtc
     // On many setups, this requires root access.
-    // card.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))
-    //     .expect("Could not set CRTC");
-    card.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))
-        .expect("Could not set CRTC");
+    card.atomic_commit(AtomicCommitFlags::ALLOW_MODESET, atomic_req)
+        .expect("Failed to set mode");
 
     gpio.set_value(0);
     std::thread::sleep(Duration::from_millis(100));
@@ -283,7 +427,7 @@ impl std::os::unix::io::AsFd for Card {
 }
 
 /// With `AsFd` implemented, we can now implement `drm::Device`.
-impl Device for Card {}
+impl drm::Device for Card {}
 impl ControlDevice for Card {}
 
 /// Simple helper methods for opening a `Card`.
@@ -321,4 +465,46 @@ pub mod capabilities {
         DC::SyncObj,
         DC::TimelineSyncObj,
     ];
+}
+
+struct XilinxDumbBuffer {
+    buffer: DumbBuffer,
+}
+
+impl From<DumbBuffer> for XilinxDumbBuffer {
+    fn from(value: DumbBuffer) -> Self {
+        XilinxDumbBuffer { buffer: value }
+    }
+}
+
+impl Into<DumbBuffer> for XilinxDumbBuffer {
+    fn into(self) -> DumbBuffer {
+        self.buffer
+    }
+}
+
+impl PlanarBuffer for XilinxDumbBuffer {
+    fn size(&self) -> (u32, u32) {
+        self.buffer.size()
+    }
+
+    fn format(&self) -> DrmFourcc {
+        self.buffer.format()
+    }
+
+    fn modifier(&self) -> Option<drm::buffer::DrmModifier> {
+        None
+    }
+
+    fn pitches(&self) -> [u32; 4] {
+        [self.buffer.pitch(), 0, 0, 0]
+    }
+
+    fn handles(&self) -> [Option<drm::buffer::Handle>; 4] {
+        [Some(self.buffer.handle()), None, None, None]
+    }
+
+    fn offsets(&self) -> [u32; 4] {
+        [0, 0, 0, 0]
+    }
 }
